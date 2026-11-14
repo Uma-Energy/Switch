@@ -5,7 +5,13 @@ export type Job = {
   service: "ride" | "package";
   city: string;
   pickup_address: string;
+  pickup_lat: number;
+  pickup_lng: number;
   dropoff_address: string;
+  dropoff_lat: number;
+  dropoff_lng: number;
+  vehicle_type: string;
+  duration_min: number;
   distance_km: number;
   fare_ngn: number;
   status: JobStatus;

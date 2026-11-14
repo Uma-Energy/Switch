@@ -85,6 +85,10 @@ export function DriverPanel() {
           <div className="text-sm font-semibold text-emerald-deep">{STATUS_LABEL[current.status]}</div>
           <p className="mt-1">{current.pickup_address} to {current.dropoff_address}</p>
           {current.package_note && <p className="text-sm text-charcoal/70">Package: {current.package_note}</p>}
+          <a target="_blank" rel="noreferrer" className="mt-2 inline-block text-sm font-medium text-emerald-deep underline"
+            href={`https://www.google.com/maps/dir/?api=1&destination=${current.status === "accepted" ? `${current.pickup_lat},${current.pickup_lng}` : `${current.dropoff_lat},${current.dropoff_lng}`}`}>
+            Navigate to {current.status === "accepted" ? "pickup" : "drop-off"}
+          </a>
           <div className="mt-3 flex items-center justify-between">
             <span className="text-xl font-bold">{formatNGN(current.fare_ngn)}</span>
             {NEXT[current.status] && (

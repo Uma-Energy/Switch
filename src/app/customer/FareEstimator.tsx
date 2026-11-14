@@ -1,9 +1,17 @@
 "use client";
+import dynamic from "next/dynamic";
 import { useEffect, useMemo, useState } from "react";
-import { formatNGN, upfrontFare, type Service, type Vehicle } from "@/lib/fare";
-import { CITIES, CITY_CENTRES } from "@/lib/cities";
+import { AddressInput } from "@/components/AddressInput";
+import { formatNGN, type Service, type Vehicle } from "@/lib/fare";
+import { CITIES } from "@/lib/cities";
+import type { Place } from "@/lib/geo";
 import { createClient } from "@/lib/supabase/client";
 import { STATUS_LABEL, type Job } from "@/lib/types";
+
+const RouteMap = dynamic(() => import("@/components/RouteMap"), {
+  ssr: false,
+  loading: () => <div className="h-56 w-full animate-pulse rounded-xl bg-black/5" />,
+});
 
 const TABS: { id: Service; label: string }[] = [
   { id: "ride", label: "Ride" },
@@ -11,40 +19,59 @@ const TABS: { id: Service; label: string }[] = [
   { id: "food", label: "Food" },
 ];
 
+type Quote = { distanceKm: number; durationMin: number; fare: number; geometry: [number, number][] };
+
 export function FareEstimator() {
   const supabase = useMemo(() => createClient(), []);
   const [service, setService] = useState<Service>("ride");
   const [city, setCity] = useState("Lagos");
   const [vehicle, setVehicle] = useState<Vehicle>("car");
-  const [km, setKm] = useState(8);
-  const [pickup, setPickup] = useState("");
-  const [dropoff, setDropoff] = useState("");
+  const [pickup, setPickup] = useState<Place | null>(null);
+  const [dropoff, setDropoff] = useState<Place | null>(null);
   const [note, setNote] = useState("");
+  const [quote, setQuote] = useState<Quote | null>(null);
+  const [quoting, setQuoting] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
-  const minutes = Math.round(km * 3.2); // placeholder until routing API
-  const fare = useMemo(
-    () => upfrontFare({ vehicle, distanceKm: km, durationMin: minutes, city, service }),
-    [vehicle, km, minutes, city, service],
+  const payload = useMemo(
+    () => pickup && dropoff && service !== "food" ? {
+      service, vehicle, city,
+      pickup: { address: pickup.label, lat: pickup.lat, lng: pickup.lng },
+      dropoff: { address: dropoff.label, lat: dropoff.lat, lng: dropoff.lng },
+    } : null,
+    [service, vehicle, city, pickup, dropoff],
   );
+
+  // Server prices the real route; the browser never decides the fare.
+  useEffect(() => {
+    setQuote(null);
+    if (!payload) return;
+    const ctl = new AbortController();
+    setQuoting(true);
+    setError("");
+    fetch("/api/quote", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload), signal: ctl.signal })
+      .then(async (r) => {
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error ?? "Could not price this trip");
+        setQuote(j as Quote);
+      })
+      .catch((e) => { if (e.name !== "AbortError") setError(e.message); })
+      .finally(() => setQuoting(false));
+    return () => ctl.abort();
+  }, [payload]);
 
   // Resume the customer's active job, then follow it in realtime.
   useEffect(() => {
-    supabase
-      .from("jobs")
-      .select("*")
-      .in("status", ["requested", "accepted", "arrived", "in_progress"])
-      .order("created_at", { ascending: false })
-      .limit(1)
+    supabase.from("jobs").select("*").in("status", ["requested", "accepted", "arrived", "in_progress"])
+      .order("created_at", { ascending: false }).limit(1)
       .then(({ data }) => data?.[0] && setJob(data[0] as Job));
   }, [supabase]);
 
   useEffect(() => {
     if (!job) return;
-    const ch = supabase
-      .channel(`job-${job.id}`)
+    const ch = supabase.channel(`job-${job.id}`)
       .on("postgres_changes", { event: "UPDATE", schema: "public", table: "jobs", filter: `id=eq.${job.id}` },
         (p) => setJob(p.new as Job))
       .subscribe();
@@ -52,24 +79,17 @@ export function FareEstimator() {
   }, [supabase, job?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function request() {
+    if (!payload) return;
     setBusy(true);
     setError("");
-    const { data: auth } = await supabase.auth.getUser();
-    const c = CITY_CENTRES[city];
-    const { data, error } = await supabase
-      .from("jobs")
-      .insert({
-        service, customer_id: auth.user!.id, city,
-        pickup_address: pickup, pickup_lat: c.lat, pickup_lng: c.lng,
-        dropoff_address: dropoff, dropoff_lat: c.lat, dropoff_lng: c.lng,
-        distance_km: km, duration_min: minutes, fare_ngn: fare,
-        package_note: service === "package" ? note || null : null,
-      })
-      .select()
-      .single();
+    const r = await fetch("/api/jobs", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...payload, note: service === "package" ? note : undefined }),
+    });
+    const j = await r.json();
     setBusy(false);
-    if (error) setError(error.message);
-    else setJob(data as Job);
+    if (!r.ok) setError(j.error ?? "Could not create the request");
+    else setJob(j as Job);
   }
 
   async function cancel() {
@@ -77,6 +97,10 @@ export function FareEstimator() {
     const { data, error } = await supabase.rpc("cancel_job", { p_job: job.id });
     if (error) setError(error.message);
     else setJob(data as Job);
+  }
+
+  function reset() {
+    setJob(null); setPickup(null); setDropoff(null); setQuote(null); setNote("");
   }
 
   const input = "w-full rounded-xl border border-black/10 bg-white px-3 py-2.5 text-charcoal-deep outline-none focus:border-emerald-brand";
@@ -89,13 +113,14 @@ export function FareEstimator() {
           <div className="text-sm text-emerald-brand">{STATUS_LABEL[job.status]}</div>
           <div className="mt-1 text-2xl font-bold">{formatNGN(job.fare_ngn)}</div>
         </div>
+        <RouteMap pickup={[job.pickup_lat, job.pickup_lng]} dropoff={[job.dropoff_lat, job.dropoff_lng]} geometry={null} />
         <p className="text-sm text-charcoal">{job.pickup_address} to {job.dropoff_address}</p>
         {error && <p className="text-sm text-red-600">{error}</p>}
         {active && ["requested", "accepted"].includes(job.status) && (
           <button onClick={cancel} className="w-full rounded-xl border border-black/10 py-2.5 text-sm">Cancel request</button>
         )}
         {!active && (
-          <button onClick={() => setJob(null)} className="w-full rounded-xl bg-emerald-brand py-3 font-semibold text-charcoal-deep">Book another</button>
+          <button onClick={reset} className="w-full rounded-xl bg-emerald-brand py-3 font-semibold text-charcoal-deep">Book another</button>
         )}
       </div>
     );
@@ -105,7 +130,7 @@ export function FareEstimator() {
     <div className="max-w-md rounded-2xl bg-white p-5 shadow-sm">
       <div className="mb-4 flex gap-1 rounded-full bg-black/5 p-1">
         {TABS.map((t) => (
-          <button key={t.id} onClick={() => setService(t.id)}
+          <button key={t.id} onClick={() => { setService(t.id); if (t.id === "ride" && vehicle === "van") setVehicle("car"); }}
             className={`flex-1 rounded-full py-2 text-sm font-medium ${service === t.id ? "bg-charcoal-deep text-white" : "text-charcoal"}`}>
             {t.label}
           </button>
@@ -118,11 +143,11 @@ export function FareEstimator() {
         </p>
       ) : (
         <div className="space-y-3">
-          <select className={input} value={city} onChange={(e) => setCity(e.target.value)}>
+          <select className={input} value={city} onChange={(e) => { setCity(e.target.value); setPickup(null); setDropoff(null); }}>
             {CITIES.map((c) => <option key={c}>{c}</option>)}
           </select>
-          <input className={input} placeholder="Pickup address" value={pickup} onChange={(e) => setPickup(e.target.value)} />
-          <input className={input} placeholder="Drop-off address" value={dropoff} onChange={(e) => setDropoff(e.target.value)} />
+          <AddressInput key={`p-${city}`} placeholder="Pickup address" city={city} value={pickup} onSelect={setPickup} />
+          <AddressInput key={`d-${city}`} placeholder="Drop-off address" city={city} value={dropoff} onSelect={setDropoff} />
           {service === "package" && (
             <input className={input} placeholder="What are you sending?" value={note} onChange={(e) => setNote(e.target.value)} />
           )}
@@ -136,16 +161,20 @@ export function FareEstimator() {
                 </button>
               ))}
           </div>
-          <label className="block text-sm text-charcoal">
-            Distance (demo until maps): {km} km
-            <input type="range" min={1} max={40} value={km} onChange={(e) => setKm(+e.target.value)} className="w-full accent-emerald-600" />
-          </label>
-          <div className="flex items-baseline justify-between rounded-xl bg-charcoal-deep p-4 text-white">
-            <span className="text-sm text-white/70">Upfront fare</span>
-            <span className="text-2xl font-bold text-emerald-brand">{formatNGN(fare)}</span>
+          {(pickup || dropoff) && (
+            <RouteMap pickup={pickup && [pickup.lat, pickup.lng]} dropoff={dropoff && [dropoff.lat, dropoff.lng]} geometry={quote?.geometry ?? null} />
+          )}
+          <div className="rounded-xl bg-charcoal-deep p-4 text-white">
+            <div className="flex items-baseline justify-between">
+              <span className="text-sm text-white/70">Upfront fare</span>
+              <span className="text-2xl font-bold text-emerald-brand">
+                {quote ? formatNGN(quote.fare) : quoting ? "Pricing..." : "-"}
+              </span>
+            </div>
+            {quote && <p className="mt-1 text-xs text-white/60">{quote.distanceKm} km, about {Math.round(quote.durationMin)} min</p>}
           </div>
           {error && <p className="text-sm text-red-600">{error}</p>}
-          <button disabled={busy || !pickup || !dropoff} onClick={request}
+          <button disabled={busy || !quote || (service === "package" && !note.trim())} onClick={request}
             className="w-full rounded-xl bg-emerald-brand py-3 font-semibold text-charcoal-deep hover:bg-emerald-400 disabled:opacity-50">
             Request {service === "ride" ? "ride" : "dispatch"}
           </button>
